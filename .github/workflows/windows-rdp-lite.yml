@@ -1,0 +1,359 @@
+name: Xydesk Windows RDP (Lite)
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Password untuk user Xydesk'
+        required: true
+        default: 'Xydesk@2026#Cloud$99'
+        type: string
+      duration:
+        description: 'Durasi RDP (jam, max 6)'
+        required: true
+        default: '6'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6']
+      rdp_port:
+        description: 'Port RDP'
+        required: true
+        default: '13389'
+        type: string
+      profile:
+        description: 'Profile install (default: full, lite: skip bahasa, minimal: cuma RDP+VSCode)'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - 'full'
+          - 'lite'
+          - 'minimal'
+
+jobs:
+  rdp:
+    name: Xydesk RDP (${{ github.event.inputs.profile }})
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    env:
+      DESKTOP_USER: Xydesk
+      DESKTOP_PASSWORD: ${{ github.event.inputs.password }}
+      RDP_PORT: ${{ github.event.inputs.rdp_port }}
+      SESSION_HOURS: ${{ github.event.inputs.duration }}
+      PROFILE: ${{ github.event.inputs.profile }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CACHE: Shared across all profiles
+      - name: Cache installers
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\tools\installers
+            C:\nodejs
+            C:\python313
+            C:\Java
+            C:\go
+            C:\php
+            C:\dotnet
+            C:\Tools\ninja
+            C:\BuildTools
+            C:\Ruby*
+            C:\Program Files\Microsoft VS Code
+            C:\Program Files\Ollama
+            C:\Users\Xydesk\.cargo
+          key: xydesk-lite-${{ runner.os }}-${{ env.PROFILE }}-${{ github.run_number }}
+          restore-keys: xydesk-lite-${{ runner.os }}-${{ env.PROFILE }}-
+
+      - name: Setup Xydesk user + RDP
+        shell: pwsh
+        run: |
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          
+          secedit /export /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          (Get-Content $env:TEMP\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db $env:TEMP\secedit.sdb /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          net accounts /minpwage:0 | Out-Null
+          
+          $securePass = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-LocalUser -Name $env:DESKTOP_USER -Password $securePass -FullName "Xydesk Admin" -PasswordNeverExpires -UserMayNotChangePassword
+          } else {
+            Set-LocalUser -Name $env:DESKTOP_USER -Password $securePass
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          Disable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+          Write-Host "User $env:DESKTOP_USER created"
+
+      - name: Configure RDP + Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value $env:RDP_PORT -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 4 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "Xydesk RDP" -Direction Inbound -Protocol TCP -LocalPort $env:RDP_PORT -Action Allow -Profile Any -ErrorAction SilentlyContinue
+          Disable-NetFirewallRule -DisplayGroup "File And Printer Sharing" -ErrorAction SilentlyContinue
+          Restart-Service TermService -Force
+          Start-Sleep 5
+          Write-Host "RDP on port $env:RDP_PORT"
+
+      # ==========================================
+      # ESSENTIAL TOOLS (all profiles)
+      # ==========================================
+      - name: Install Git (cached)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            $gitInstaller = "C:\tools\installers\git-installer.exe"
+            Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-64-bit.exe" -OutFile $gitInstaller
+            Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-","/CLOSEAPPLICATIONS","/RESTARTAPPLICATIONS","/COMPONENTS=icons,ext,ext\reg,autoupdate,windowsterminal" -Wait
+          }
+
+      - name: Install Chrome (cached)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command chrome -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            $chromeMsi = "C:\tools\installers\chrome-installer.msi"
+            Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise64.msi" -OutFile $chromeMsi
+            Start-Process msiexec.exe -ArgumentList "/i","$chromeMsi","/quiet" -Wait
+          }
+
+      - name: Install VS Code (cached)
+        shell: pwsh
+        run: |
+          $vscodeExe = "C:\Program Files\Microsoft VS Code\Code.exe"
+          if (-not (Test-Path $vscodeExe)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://update.code.visualstudio.com/latest/win32-x64/stable" -OutFile "C:\tools\installers\vscode-installer.exe"
+            Start-Process -FilePath "C:\tools\installers\vscode-installer.exe" -ArgumentList "/quiet","/norestart","/mergetasks=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" -Wait
+          }
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+          & $code --install-extension ms-python.python 2>$null
+          & $code --install-extension dbaeumer.vscode-eslint 2>$null
+          & $code --install-extension esbenp.prettier-vscode 2>$null
+          & $code --install-extension Continue.continue 2>$null
+          & $code --install-extension PKief.material-icon-theme 2>$null
+
+      # ==========================================
+      # LITE PROFILE: Python + Node only
+      # ==========================================
+      - name: Install Python (lite/full)
+        if: env.PROFILE != 'minimal'
+        shell: pwsh
+        run: |
+          $pythonPath = "C:\python313"
+          if (-not (Test-Path "$pythonPath\python.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.13.7/python-3.13.7-amd64.exe" -OutFile "C:\tools\installers\python-installer.exe"
+            Start-Process -FilePath "C:\tools\installers\python-installer.exe" -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1","TargetDir=$pythonPath","Include_test=0","Include_doc=0" -Wait
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;$pythonPath;$pythonPath\Scripts", [EnvironmentVariableTarget]::Machine)
+            & "$pythonPath\python.exe" -m pip install --upgrade pip requests numpy fastapi uvicorn pydantic
+          }
+
+      - name: Install Node.js (lite/full)
+        if: env.PROFILE != 'minimal'
+        shell: pwsh
+        run: |
+          $nodePath = "C:\nodejs"
+          if (-not (Test-Path "$nodePath\node.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v24.11.0/node-v24.11.0-win-x64.zip" -OutFile "C:\tools\installers\node.zip"
+            Expand-Archive -Path "C:\tools\installers\node.zip" -DestinationPath $nodePath -Force
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;$nodePath", [EnvironmentVariableTarget]::Machine)
+            & "$nodePath\npm.cmd" install -g typescript ts-node pnpm yarn nodemon
+          }
+
+      # ==========================================
+      # FULL PROFILE: All languages
+      # ==========================================
+      - name: Install Java (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          $javaRoot = "C:\Java"
+          if (-not (Test-Path $javaRoot)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25%2B36/OpenJDK25U-jdk_x64_windows_hotspot_25_36.zip" -OutFile "C:\tools\installers\jdk25.zip"
+            Expand-Archive -Path "C:\tools\installers\jdk25.zip" -DestinationPath $javaRoot -Force
+            $jdk = (Get-ChildItem $javaRoot | Select-Object -First 1).FullName
+            [Environment]::SetEnvironmentVariable("JAVA_HOME", $jdk, [EnvironmentVariableTarget]::Machine)
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;$jdk\bin", [EnvironmentVariableTarget]::Machine)
+          }
+
+      - name: Install C++ Build Tools (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\BuildTools\VC\Tools\MSVC")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile "C:\tools\installers\vs_buildtools.exe"
+            $args = @("--quiet","--wait","--norestart","--nocache","--add","Microsoft.VisualStudio.Workload.VCTools","--includeRecommended","--installPath","C:\BuildTools")
+            Start-Process -FilePath "C:\tools\installers\vs_buildtools.exe" -ArgumentList $args -Wait
+          }
+
+      - name: Install Rust (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Users\Xydesk\.cargo\bin\cargo.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "C:\tools\installers\rustup-init.exe"
+            Start-Process -FilePath "C:\tools\installers\rustup-init.exe" -ArgumentList "-y","--default-toolchain","1.91.0","--profile","minimal" -Wait
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:USERPROFILE\.cargo\bin", [EnvironmentVariableTarget]::Machine)
+          }
+
+      - name: Install Go (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\go\bin\go.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://go.dev/dl/go1.25.1.windows-amd64.zip" -OutFile "C:\tools\installers\go.zip"
+            Expand-Archive -Path "C:\tools\installers\go.zip" -DestinationPath "C:\" -Force
+            [Environment]::SetEnvironmentVariable("GOROOT", "C:\go", [EnvironmentVariableTarget]::Machine)
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\go\bin", [EnvironmentVariableTarget]::Machine)
+          }
+
+      - name: Install PHP (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\php\php.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            try {
+              Invoke-WebRequest -Uri "https://windows.php.net/downloads/releases/archives/php-8.4.12-Win32-vs17-x64.zip" -OutFile "C:\tools\installers\php.zip" -ErrorAction Stop
+            } catch {
+              Invoke-WebRequest -Uri "https://windows.php.net/downloads/releases/php-8.4.12-Win32-vs17-x64.zip" -OutFile "C:\tools\installers\php.zip"
+            }
+            Expand-Archive -Path "C:\tools\installers\php.zip" -DestinationPath "C:\php" -Force
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\php", [EnvironmentVariableTarget]::Machine)
+          }
+
+      - name: Install Ruby (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Ruby34-x64\bin\ruby.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.4.5-1/rubyinstaller-3.4.5-1-x64.exe" -OutFile "C:\tools\installers\ruby.exe"
+            Start-Process -FilePath "C:\tools\installers\ruby.exe" -ArgumentList "/quiet","/norestart" -Wait
+          }
+
+      - name: Install .NET (full only)
+        if: env.PROFILE == 'full'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\dotnet\dotnet.exe")) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile "C:\tools\installers\dotnet-install.ps1"
+            & "C:\tools\installers\dotnet-install.ps1" -Channel 9.0 -InstallDir "C:\dotnet"
+            [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\dotnet", [EnvironmentVariableTarget]::Machine)
+          }
+
+      # ==========================================
+      # OPTIONAL: AI, Docker
+      # ==========================================
+      - name: Install Ollama (optional, full/lite)
+        if: env.PROFILE != 'minimal'
+        shell: pwsh
+        run: |
+          $ollamaExe = "C:\Users\Xydesk\AppData\Local\Programs\Ollama\ollama.exe"
+          if (-not (Test-Path $ollamaExe)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile "C:\tools\installers\ollama-setup.exe"
+            Start-Process -FilePath "C:\tools\installers\ollama-setup.exe" -ArgumentList "/S" -Wait
+            Start-Sleep 10
+          }
+
+      - name: Install Docker (optional)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Path "C:\tools\installers" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe" -OutFile "C:\tools\installers\docker.exe"
+            Start-Process -FilePath "C:\tools\installers\docker.exe" -ArgumentList "install","--quiet","--accept-license" -Wait
+          }
+
+      - name: Setup Cloudflare Tunnel
+        if: env.CLOUDFLARE_TUNNEL_TOKEN != ''
+        shell: pwsh
+        run: |
+          $cfExe = "C:\tools\cloudflared.exe"
+          if (-not (Test-Path $cfExe)) {
+            New-Item -ItemType Directory -Path "C:\tools" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfExe
+          }
+          & $cfExe service uninstall 2>$null
+          Start-Sleep 2
+          & $cfExe service install $env:CLOUDFLARE_TUNNEL_TOKEN
+          Start-Sleep 5
+          & $cfExe service start
+          Start-Sleep 5
+          Write-Host "Cloudflare Tunnel running"
+
+      - name: Apply Xydesk theme
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0 -Force
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0 -Force
+          Write-Host "Dark theme applied"
+
+      - name: Security hardening
+        shell: pwsh
+        run: |
+          net accounts /lockoutthreshold:5 /lockoutduration:15 | Out-Null
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          Write-Host "Security applied"
+
+      - name: Get connection info
+        shell: pwsh
+        run: |
+          $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Select-Object -First 1).IPAddress
+          $summary = @"
+          ==============================================
+            XYDESK RDP READY (Profile: $env:PROFILE)
+          ==============================================
+            User:     $env:DESKTOP_USER
+            Pass:     $env:DESKTOP_PASSWORD
+            Port:     $env:RDP_PORT
+            Lifetime: $env:SESSION_HOURS hours
+            IP:       $ip
+          ==============================================
+          "@
+          $summary | Out-File -FilePath "$env:GITHUB_STEP_SUMMARY" -Encoding utf8
+          Write-Host $summary
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $endTime = (Get-Date).AddHours([int]$env:SESSION_HOURS)
+          while ((Get-Date) -lt $endTime) {
+            $remaining = $endTime - (Get-Date)
+            Write-Host "Time remaining: $($remaining.ToString('hh\:mm\:ss'))"
+            try {
+              $ts = Get-Service TermService -ErrorAction Stop
+              if ($ts.Status -ne 'Running') { Start-Service TermService }
+            } catch {}
+            Start-Sleep 300
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: Write-Host "Cleanup done"
