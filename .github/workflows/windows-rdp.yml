@@ -80,17 +80,12 @@ jobs:
           powercfg -change -hibernate-timeout-ac 0
           
           # Create Xydesk user with admin rights
-          $password = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
+          $securePass = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
           $existing = Get-LocalUser -Name $env:DESKTOP_USER -ErrorAction SilentlyContinue
           if (-not $existing) {
-            New-LocalUser -Name $env:DESKTOP_USER `
-                          -Password $password `
-                          -FullName "Xydesk Admin" `
-                          -Description "Custom RDP admin for Xydesk Cloud" `
-                          -PasswordNeverExpires `
-                          -UserMayNotChangePassword
+            New-LocalUser -Name $env:DESKTOP_USER -Password $securePass -FullName "Xydesk Admin" -Description "Custom RDP admin for Xydesk Cloud" -PasswordNeverExpires -UserMayNotChangePassword
           } else {
-            Set-LocalUser -Name $env:DESKTOP_USER -Password $password
+            Set-LocalUser -Name $env:DESKTOP_USER -Password $securePass
           }
           
           # Add to Administrators + Remote Desktop Users
@@ -106,32 +101,21 @@ jobs:
         shell: pwsh
         run: |
           # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "PortNumber" -Value $env:RDP_PORT -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value $env:RDP_PORT -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
           
           # Enable Network Level Authentication
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
           
           # Force TLS 1.3 for RDP security
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "MinEncryptionLevel" -Value 4 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 4 -Force
           
           # Firewall rules
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          New-NetFirewallRule -DisplayName "Xydesk Custom RDP" `
-                              -Direction Inbound `
-                              -Protocol TCP `
-                              -LocalPort $env:RDP_PORT `
-                              -Action Allow `
-                              -Profile Any `
-                              -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Xydesk Custom RDP" -Direction Inbound -Protocol TCP -LocalPort $env:RDP_PORT -Action Allow -Profile Any -ErrorAction SilentlyContinue
           
-          # Disable SMB, Telnet, etc for security
+          # Disable SMB for security
           Disable-NetFirewallRule -DisplayGroup "File And Printer Sharing" -ErrorAction SilentlyContinue
           
           # Restart TermService
@@ -186,12 +170,8 @@ jobs:
           # Visual Studio Build Tools 2022 with C++ workload
           $vsBootstrapper = "$env:TEMP\vs_buildtools.exe"
           Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile $vsBootstrapper
-          Start-Process -FilePath $vsBootstrapper -ArgumentList `
-            "--quiet", "--wait", "--norestart", "--nocache", `
-            "--add", "Microsoft.VisualStudio.Workload.VCTools", `
-            "--includeRecommended", `
-            "--installPath", "C:\BuildTools" `
-            -Wait
+          $vsArgs = @("--quiet", "--wait", "--norestart", "--nocache", "--add", "Microsoft.VisualStudio.Workload.VCTools", "--includeRecommended", "--installPath", "C:\BuildTools")
+          Start-Process -FilePath $vsBootstrapper -ArgumentList $vsArgs -Wait
           
           # CMake (latest)
           $cmakeInstaller = "$env:TEMP\cmake-installer.msi"
