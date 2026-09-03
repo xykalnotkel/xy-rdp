@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       password:
-        description: 'Password untuk user Xydesk (min 8 char, alphanumeric)'
+        description: 'Password untuk user Xydesk (min 8 char, alphanumeric + special char WAJIB)'
         required: true
-        default: 'Xydesk2026!Secure'
+        default: 'Xydesk@2026#Cloud$99'
         type: string
       duration:
         description: 'Durasi RDP hidup (jam, max 6)'
@@ -78,6 +78,15 @@ jobs:
           powercfg -change -monitor-timeout-ac 0
           powercfg -change -disk-timeout-ac 0
           powercfg -change -hibernate-timeout-ac 0
+          
+          # Relax password complexity to accept user-provided password
+          # (We do this in case the password doesn't meet strict complexity)
+          secedit /export /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          (Get-Content $env:TEMP\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db $env:TEMP\secedit.sdb /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          
+          # Disable password history minimum age requirement
+          net accounts /minpwage:0 | Out-Null
           
           # Create Xydesk user with admin rights
           $securePass = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
