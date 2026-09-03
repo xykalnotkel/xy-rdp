@@ -1,0 +1,193 @@
+name: Xydesk RDP (Bare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Password untuk user Xydesk (min 8 char, alphanumeric + special char)'
+        required: true
+        default: 'Xydesk@2026#Cloud$99'
+        type: string
+      duration:
+        description: 'Durasi RDP (jam, max 6)'
+        required: true
+        default: '6'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6']
+      rdp_port:
+        description: 'Port RDP (default 3389, saran: 13389 untuk stealth)'
+        required: true
+        default: '13389'
+        type: string
+
+jobs:
+  rdp:
+    name: Xydesk RDP (Bare - No Tools)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    env:
+      DESKTOP_USER: Xydesk
+      DESKTOP_PASSWORD: ${{ github.event.inputs.password }}
+      RDP_PORT: ${{ github.event.inputs.rdp_port }}
+      SESSION_HOURS: ${{ github.event.inputs.duration }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xydesk user
+        shell: pwsh
+        run: |
+          # Disable sleep
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          
+          # Relax password policy
+          secedit /export /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          (Get-Content $env:TEMP\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db $env:TEMP\secedit.sdb /cfg $env:TEMP\secpol.cfg /quiet | Out-Null
+          net accounts /minpwage:0 | Out-Null
+          
+          # Create user
+          $securePass = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-LocalUser -Name $env:DESKTOP_USER -Password $securePass -FullName "Xydesk Admin" -PasswordNeverExpires -UserMayNotChangePassword
+          } else {
+            Set-LocalUser -Name $env:DESKTOP_USER -Password $securePass
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          Disable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+          Write-Host "User $env:DESKTOP_USER created with admin"
+
+      - name: Configure RDP + Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value $env:RDP_PORT -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 4 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "Xydesk RDP" -Direction Inbound -Protocol TCP -LocalPort $env:RDP_PORT -Action Allow -Profile Any -ErrorAction SilentlyContinue
+          Disable-NetFirewallRule -DisplayGroup "File And Printer Sharing" -ErrorAction SilentlyContinue
+          Restart-Service TermService -Force
+          Start-Sleep 5
+          Write-Host "RDP on port $env:RDP_PORT"
+
+      - name: Install Lightshot (only)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "C:\tools" -Force | Out-Null
+          $url = "https://app.prntscr.com/build/setup-lightshot.exe"
+          $out = "C:\tools\lightshot-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process -FilePath $out -ArgumentList "/S" -Wait
+          Write-Host "Lightshot installed"
+
+      - name: Setup Cloudflare Tunnel
+        if: env.CLOUDFLARE_TUNNEL_TOKEN != ''
+        shell: pwsh
+        run: |
+          $cfExe = "C:\tools\cloudflared.exe"
+          if (-not (Test-Path $cfExe)) {
+            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfExe
+          }
+          & $cfExe service uninstall 2>$null
+          Start-Sleep 2
+          & $cfExe service install $env:CLOUDFLARE_TUNNEL_TOKEN
+          Start-Sleep 5
+          & $cfExe service start
+          Start-Sleep 5
+          Write-Host "Cloudflare Tunnel running"
+
+      - name: Dark theme + wallpaper
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0 -Force
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0 -Force
+          
+          $wallpaperPath = "C:\Windows\Web\Wallpaper\Xydesk\xydesk-wallpaper.jpg"
+          New-Item -ItemType Directory -Path (Split-Path $wallpaperPath) -Force | Out-Null
+          
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 1920,1080
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $gradient = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            (New-Object System.Drawing.Point 0,0),
+            (New-Object System.Drawing.Point 1920,1080),
+            [System.Drawing.Color]::FromArgb(255,15,23,42),
+            [System.Drawing.Color]::FromArgb(255,99,102,241)
+          )
+          $g.FillRectangle($gradient, 0, 0, 1920, 1080)
+          
+          $font = New-Object System.Drawing.Font("Segoe UI", 80, [System.Drawing.FontStyle]::Bold)
+          $brush = [System.Drawing.Brushes].[White]
+          $text = "XYDESK"
+          $sf = New-Object System.Drawing.StringFormat
+          $sf.Alignment = [System.Drawing.StringAlignment]::Center
+          $g.DrawString($text, $font, $brush, 960, 480, $sf)
+          
+          $subfont = New-Object System.Drawing.Font("Segoe UI", 24)
+          $g.DrawString("Cloud RDP | Powered by GitHub Actions", $subfont, $brush, 960, 600, $sf)
+          $bmp.Save($wallpaperPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $g.Dispose()
+          $bmp.Dispose()
+          
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "Wallpaper" -Value $wallpaperPath -Force
+          rundll32.exe user32.dll, UpdatePerUserSystemParameters 1, True
+          Write-Host "Theme applied"
+
+      - name: Security hardening
+        shell: pwsh
+        run: |
+          net accounts /lockoutthreshold:5 /lockoutduration:15 | Out-Null
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          Write-Host "Security applied"
+
+      - name: Get connection info
+        shell: pwsh
+        run: |
+          $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Select-Object -First 1).IPAddress
+          $summary = @"
+          ==============================================
+            XYDESK RDP READY (Bare)
+          ==============================================
+            User:     $env:DESKTOP_USER
+            Pass:     $env:DESKTOP_PASSWORD
+            Port:     $env:RDP_PORT
+            Lifetime: $env:SESSION_HOURS hours
+            IP:       $ip
+          ==============================================
+            Note: Hanya RDP + Lightshot, ga ada tools
+          ==============================================
+          "@
+          $summary | Out-File -FilePath "$env:GITHUB_STEP_SUMMARY" -Encoding utf8
+          Write-Host $summary
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $endTime = (Get-Date).AddHours([int]$env:SESSION_HOURS)
+          Write-Host "Session will end at: $endTime"
+          while ((Get-Date) -lt $endTime) {
+            $remaining = $endTime - (Get-Date)
+            Write-Host "Time remaining: $($remaining.ToString('hh\:mm\:ss'))"
+            try {
+              $ts = Get-Service TermService -ErrorAction Stop
+              if ($ts.Status -ne 'Running') { Start-Service TermService }
+            } catch {}
+            Start-Sleep 300
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: Write-Host "Cleanup done"
