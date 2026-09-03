@@ -1,0 +1,498 @@
+name: Xydesk Windows RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Password untuk user Xydesk (min 8 char, alphanumeric)'
+        required: true
+        default: 'Xydesk2026!Secure'
+        type: string
+      duration:
+        description: 'Durasi RDP hidup (jam, max 6)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+      rdp_port:
+        description: 'Port RDP (default 3389, saran: 13389 untuk stealth)'
+        required: true
+        default: '13389'
+        type: string
+      install_ai:
+        description: 'Install Ollama + LM Studio?'
+        required: true
+        default: 'true'
+        type: boolean
+      install_docker:
+        description: 'Install Docker Desktop?'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  rdp:
+    name: Windows Server RDP - Xydesk
+    runs-on: windows-2022
+    
+    permissions:
+      contents: read
+    
+    env:
+      DESKTOP_USER: Xydesk
+      DESKTOP_PASSWORD: ${{ github.event.inputs.password }}
+      RDP_PORT: ${{ github.event.inputs.rdp_port }}
+      SESSION_HOURS: ${{ github.event.inputs.duration }}
+      INSTALL_AI: ${{ github.event.inputs.install_ai }}
+      INSTALL_DOCKER: ${{ github.event.inputs.install_docker }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # Dev environment versions (updated 2026-09-04)
+      NODE_VERSION: '24.11.0-lts'
+      PYTHON_VERSION: '3.13.7'
+      GO_VERSION: '1.25.1'
+      RUST_VERSION: '1.91.0'
+      JAVA_VERSION: '25'
+      DOTNET_VERSION: '9.0.108'
+      PHP_VERSION: '8.4.12'
+      RUBY_VERSION: '3.4.5'
+      VSCODE_VERSION: '1.96.0'
+      OLLAMA_VERSION: '0.11.10'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xydesk user + RDP
+        shell: pwsh
+        run: |
+          # Disable screen lock / sleep
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          
+          # Create Xydesk user with admin rights
+          $password = ConvertTo-SecureString $env:DESKTOP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-LocalUser -Name $env:DESKTOP_USER `
+                          -Password $password `
+                          -FullName "Xydesk Admin" `
+                          -Description "Custom RDP admin for Xydesk Cloud" `
+                          -PasswordNeverExpires `
+                          -UserMayNotChangePassword
+          } else {
+            Set-LocalUser -Name $env:DESKTOP_USER -Password $password
+          }
+          
+          # Add to Administrators + Remote Desktop Users
+          Add-LocalGroupMember -Group "Administrators" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
+          
+          # Disable the default runneradmin for security
+          Disable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+          
+          Write-Host "User $env:DESKTOP_USER created with admin privileges"
+
+      - name: Configure RDP + Firewall
+        shell: pwsh
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "PortNumber" -Value $env:RDP_PORT -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 2 -Force
+          
+          # Enable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 1 -Force
+          
+          # Force TLS 1.3 for RDP security
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MinEncryptionLevel" -Value 4 -Force
+          
+          # Firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "Xydesk Custom RDP" `
+                              -Direction Inbound `
+                              -Protocol TCP `
+                              -LocalPort $env:RDP_PORT `
+                              -Action Allow `
+                              -Profile Any `
+                              -ErrorAction SilentlyContinue
+          
+          # Disable SMB, Telnet, etc for security
+          Disable-NetFirewallRule -DisplayGroup "File And Printer Sharing" -ErrorAction SilentlyContinue
+          
+          # Restart TermService
+          Restart-Service TermService -Force
+          Start-Sleep 5
+          
+          Write-Host "RDP configured on port $env:RDP_PORT with TLS 1.3"
+
+      - name: Install Python 3.13 (latest)
+        shell: pwsh
+        run: |
+          $url = "https://www.python.org/ftp/python/$env:PYTHON_VERSION/python-$env:PYTHON_VERSION-amd64.exe"
+          $out = "$env:TEMP\python-installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process -FilePath $out -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0","Include_doc=0","Include_launcher=1" -Wait
+          py -m pip install --upgrade pip setuptools wheel
+          py -m pip install --upgrade requests numpy pandas fastapi uvicorn httpx pydantic
+          Write-Host "Python $env:PYTHON_VERSION installed"
+
+      - name: Install Node.js 24 LTS + npm
+        shell: pwsh
+        run: |
+          $arch = "win-x64"
+          $nodeVer = $env:NODE_VERSION.Replace('-lts','')
+          $zip = "node-v$nodeVer-$arch.zip"
+          $url = "https://nodejs.org/dist/v$nodeVer/$zip"
+          $out = "$env:TEMP\$zip"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Expand-Archive -Path $out -DestinationPath "C:\nodejs" -Force
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\nodejs", [EnvironmentVariableTarget]::Machine)
+          $env:Path = "$env:Path;C:\nodejs"
+          corepack enable
+          corepack prepare pnpm@latest --activate
+          npm install -g npm@latest typescript@latest ts-node@latest nodemon@latest pnpm@latest yarn@latest
+          Write-Host "Node.js 24 LTS installed"
+
+      - name: Install Java 25 (OpenJDK LTS)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25%2B36/OpenJDK25U-jdk_x64_windows_hotspot_25_36.zip"
+          $out = "$env:TEMP\jdk25.zip"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Expand-Archive -Path $out -DestinationPath "C:\Java" -Force
+          $jdkPath = (Get-ChildItem "C:\Java" | Select-Object -First 1).FullName
+          [Environment]::SetEnvironmentVariable("JAVA_HOME", $jdkPath, [EnvironmentVariableTarget]::Machine)
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;$jdkPath\bin", [EnvironmentVariableTarget]::Machine)
+          Write-Host "Java 25 installed at $jdkPath"
+
+      - name: Install C++ Build Tools + CMake
+        shell: pwsh
+        run: |
+          # Visual Studio Build Tools 2022 with C++ workload
+          $vsBootstrapper = "$env:TEMP\vs_buildtools.exe"
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile $vsBootstrapper
+          Start-Process -FilePath $vsBootstrapper -ArgumentList `
+            "--quiet", "--wait", "--norestart", "--nocache", `
+            "--add", "Microsoft.VisualStudio.Workload.VCTools", `
+            "--includeRecommended", `
+            "--installPath", "C:\BuildTools" `
+            -Wait
+          
+          # CMake (latest)
+          $cmakeInstaller = "$env:TEMP\cmake-installer.msi"
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v4.1.2/cmake-4.1.2-windows-x86_64.msi" -OutFile $cmakeInstaller
+          Start-Process msiexec.exe -ArgumentList "/i","$cmakeInstaller","/quiet","ADD_CMAKE_TO_PATH=System" -Wait
+          
+          # Ninja build system
+          Invoke-WebRequest -Uri "https://github.com/ninja-build/ninja/releases/download/v1.13.1/ninja-win.zip" -OutFile "$env:TEMP\ninja.zip"
+          Expand-Archive -Path "$env:TEMP\ninja.zip" -DestinationPath "C:\Tools\ninja" -Force
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\Tools\ninja", [EnvironmentVariableTarget]::Machine)
+          
+          Write-Host "C++ Build Tools + CMake installed"
+
+      - name: Install Rust (stable)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
+          Start-Process -FilePath "$env:TEMP\rustup-init.exe" -ArgumentList "-y","--default-toolchain",$env:RUST_VERSION,"--profile","minimal" -Wait
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:USERPROFILE\.cargo\bin", [EnvironmentVariableTarget]::Machine)
+          Write-Host "Rust $env:RUST_VERSION installed"
+
+      - name: Install Go 1.25
+        shell: pwsh
+        run: |
+          $goZip = "go$($env:GO_VERSION).windows-amd64.zip"
+          Invoke-WebRequest -Uri "https://go.dev/dl/$goZip" -OutFile "$env:TEMP\$goZip"
+          Expand-Archive -Path "$env:TEMP\$goZip" -DestinationPath "C:\" -Force
+          [Environment]::SetEnvironmentVariable("GOROOT", "C:\go", [EnvironmentVariableTarget]::Machine)
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\go\bin", [EnvironmentVariableTarget]::Machine)
+          Write-Host "Go $env:GO_VERSION installed"
+
+      - name: Install PHP 8.4 + Composer
+        shell: pwsh
+        run: |
+          $phpZip = "php-$env:PHP_VERSION-Win32-vs17-x64.zip"
+          Invoke-WebRequest -Uri "https://windows.php.net/downloads/releases/archives/$phpZip" -OutFile "$env:TEMP\$phpZip"
+          # Fallback to current releases if archive not found
+          if (-not (Test-Path "$env:TEMP\$phpZip") -or (Get-Item "$env:TEMP\$phpZip").Length -lt 1MB) {
+            Invoke-WebRequest -Uri "https://windows.php.net/downloads/releases/php-$env:PHP_VERSION-Win32-vs17-x64.zip" -OutFile "$env:TEMP\$phpZip"
+          }
+          Expand-Archive -Path "$env:TEMP\$phpZip" -DestinationPath "C:\php" -Force
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\php", [EnvironmentVariableTarget]::Machine)
+          # Composer
+          Invoke-WebRequest -Uri "https://getcomposer.org/installer" -OutFile "$env:TEMP\composer-setup.php"
+          php "$env:TEMP\composer-setup.php" --install-dir=C:\php --filename=composer
+          Write-Host "PHP $env:PHP_VERSION + Composer installed"
+
+      - name: Install Ruby 3.4
+        shell: pwsh
+        run: |
+          $rubyMsi = "rubyinstaller-$env:RUBY_VERSION-1-x64.exe"
+          Invoke-WebRequest -Uri "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-$env:RUBY_VERSION-1/$rubyMsi" -OutFile "$env:TEMP\$rubyMsi"
+          Start-Process -FilePath "$env:TEMP\$rubyMsi" -ArgumentList "/quiet","/norestart" -Wait
+          Write-Host "Ruby $env:RUBY_VERSION installed"
+
+      - name: Install .NET 9 SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile "$env:TEMP\dotnet-install.ps1"
+          & "$env:TEMP\dotnet-install.ps1" -Channel 9.0 -InstallDir "C:\dotnet"
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\dotnet", [EnvironmentVariableTarget]::Machine)
+          Write-Host ".NET 9 installed"
+
+      - name: Install Visual Studio Code (latest)
+        shell: pwsh
+        run: |
+          $vscodeExe = "$env:TEMP\vscode-installer.exe"
+          Invoke-WebRequest -Uri "https://update.code.visualstudio.com/latest/win32-x64/stable" -OutFile $vscodeExe
+          Start-Process -FilePath $vscodeExe -ArgumentList "/quiet","/norestart","/mergetasks=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" -Wait
+          
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+          & $code --install-extension ms-python.python
+          & $code --install-extension dbaeumer.vscode-eslint
+          & $code --install-extension esbenp.prettier-vscode
+          & $code --install-extension ms-vscode.cpptools
+          & $code --install-extension rust-lang.rust-analyzer
+          & $code --install-extension ms-dotnettools.csharp
+          & $code --install-extension vscjava.vscode-java-pack
+          & $code --install-extension golang.Go
+          & $code --install-extension PKief.material-icon-theme
+          & $code --install-extension Continue.continue
+          & $code --install-extension RooCodeInc.roo-cline
+          
+          Write-Host "VS Code + extensions installed"
+
+      - name: Install Git + GitHub CLI
+        shell: pwsh
+        run: |
+          $gitInstaller = "$env:TEMP\git-installer.exe"
+          Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-64-bit.exe" -OutFile $gitInstaller
+          Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-","/CLOSEAPPLICATIONS","/RESTARTAPPLICATIONS","/COMPONENTS=icons,ext,ext\reg,ext\reg\shellhere,autoupdate,windowsterminal,scalar" -Wait
+          
+          $ghMsi = "$env:TEMP\gh-installer.msi"
+          Invoke-WebRequest -Uri "https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_windows_amd64.msi" -OutFile $ghMsi
+          Start-Process msiexec.exe -ArgumentList "/i","$ghMsi","/quiet" -Wait
+          
+          Write-Host "Git + GitHub CLI installed"
+
+      - name: Install browsers + dev tools
+        shell: pwsh
+        run: |
+          $chromeMsi = "$env:TEMP\chrome-installer.msi"
+          Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise64.msi" -OutFile $chromeMsi
+          Start-Process msiexec.exe -ArgumentList "/i","$chromeMsi","/quiet" -Wait
+          
+          $postmanExe = "$env:TEMP\postman-setup.exe"
+          Invoke-WebRequest -Uri "https://dl.pstmn.io/download/latest/win64" -OutFile $postmanExe
+          Start-Process -FilePath $postmanExe -ArgumentList "/S" -Wait
+          
+          $7zInstaller = "$env:TEMP\7z-setup.exe"
+          Invoke-WebRequest -Uri "https://www.7-zip.org/a/7z2501-x64.exe" -OutFile $7zInstaller
+          Start-Process -FilePath $7zInstaller -ArgumentList "/S" -Wait
+          
+          Write-Host "Chrome, Postman, 7-Zip installed"
+
+      - name: Install Ollama (if enabled)
+        if: env.INSTALL_AI == 'true'
+        shell: pwsh
+        run: |
+          $ollamaSetup = "$env:TEMP\ollama-setup.exe"
+          Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $ollamaSetup
+          Start-Process -FilePath $ollamaSetup -ArgumentList "/S" -Wait
+          Start-Sleep 10
+          & "C:\Users\$env:DESKTOP_USER\AppData\Local\Programs\Ollama\ollama.exe" pull llama3.2:3b 2>$null
+          & "C:\Users\$env:DESKTOP_USER\AppData\Local\Programs\Ollama\ollama.exe" pull qwen2.5-coder:7b 2>$null
+          Write-Host "Ollama + models installed"
+
+      - name: Install Docker Desktop (if enabled)
+        if: env.INSTALL_DOCKER == 'true'
+        shell: pwsh
+        run: |
+          $dockerMsi = "$env:TEMP\docker-installer.msi"
+          Invoke-WebRequest -Uri "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe" -OutFile $dockerMsi
+          Start-Process -FilePath $dockerMsi -ArgumentList "install","--quiet","--accept-license" -Wait
+          Write-Host "Docker Desktop installed"
+
+      - name: Setup Tailscale (private network)
+        if: env.TAILSCALE_AUTH_KEY != ''
+        shell: pwsh
+        run: |
+          $tailscaleMsi = "$env:TEMP\tailscale-setup.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tailscaleMsi
+          Start-Process msiexec.exe -ArgumentList "/i","$tailscaleMsi","/quiet","/norestart" -Wait
+          Start-Sleep 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=xydesk-rdp
+          $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "Tailscale connected: $tsIP"
+
+      - name: Setup Cloudflare Tunnel (public domain)
+        if: env.CLOUDFLARE_TUNNEL_TOKEN != ''
+        shell: pwsh
+        run: |
+          $cfExe = "C:\tools\cloudflared.exe"
+          New-Item -ItemType Directory -Path "C:\tools" -Force | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfExe
+          
+          & $cfExe service install $env:CLOUDFLARE_TUNNEL_TOKEN
+          Start-Sleep 5
+          & $cfExe service start
+          Start-Sleep 10
+          
+          Write-Host "Cloudflare Tunnel running"
+
+      - name: Customize desktop (Xydesk theme)
+        shell: pwsh
+        run: |
+          # Set dark theme
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0 -Force
+          Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0 -Force
+          
+          # Wallpaper - create custom Xydesk wallpaper
+          $wallpaperPath = "C:\Windows\Web\Wallpaper\Xydesk\xydesk-wallpaper.jpg"
+          New-Item -ItemType Directory -Path (Split-Path $wallpaperPath) -Force | Out-Null
+          
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 1920,1080
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $gradient = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            (New-Object System.Drawing.Point 0,0),
+            (New-Object System.Drawing.Point 1920,1080),
+            [System.Drawing.Color]::FromArgb(255,15,23,42),
+            [System.Drawing.Color]::FromArgb(255,99,102,241)
+          )
+          $g.FillRectangle($gradient, 0, 0, 1920, 1080)
+          
+          $font = New-Object System.Drawing.Font("Segoe UI", 80, [System.Drawing.FontStyle]::Bold)
+          $brush = [System.Drawing.Brushes]::White
+          $text = "XYDESK"
+          $sf = New-Object System.Drawing.StringFormat
+          $sf.Alignment = [System.Drawing.StringAlignment]::Center
+          $g.DrawString($text, $font, $brush, 960, 480, $sf)
+          
+          $subfont = New-Object System.Drawing.Font("Segoe UI", 24)
+          $g.DrawString("Cloud RDP | Powered by GitHub Actions", $subfont, $brush, 960, 600, $sf)
+          $bmp.Save($wallpaperPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $g.Dispose()
+          $bmp.Dispose()
+          
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "Wallpaper" -Value $wallpaperPath -Force
+          rundll32.exe user32.dll, UpdatePerUserSystemParameters 1, True
+          
+          # Pin VS Code to taskbar
+          $shell = New-Object -ComObject WScript.Shell
+          $taskbar = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+          $vscodeShortcut = "$taskbar\Visual Studio Code.lnk"
+          $vscodeTarget = "C:\Program Files\Microsoft VS Code\Code.exe"
+          $s = $shell.CreateShortcut($vscodeShortcut)
+          $s.TargetPath = $vscodeTarget
+          $s.Save()
+          
+          Write-Host "Custom Xydesk desktop applied"
+
+      - name: Apply security hardening
+        shell: pwsh
+        run: |
+          # Disable unnecessary services
+          $services = @("RemoteRegistry", "SSDPSRV", "upnphost", "WMPNetworkSvc")
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          
+          # Disable SMBv1 (security risk)
+          Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction SilentlyContinue
+          
+          # Enable Windows Defender real-time
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          Update-MpSignature
+          
+          # Clear temp files
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          # Set account lockout policy (5 attempts)
+          net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
+          
+          # Enable audit logging
+          auditpol /set /category:"Logon/Logoff" /success:enable /failure:enable | Out-Null
+          auditpol /set /category:"Account Management" /success:enable /failure:enable | Out-Null
+          
+          Write-Host "Security hardening applied"
+
+      - name: Get connection info
+        shell: pwsh
+        run: |
+          $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Select-Object -First 1).IPAddress
+          
+          $tailscaleIP = ""
+          if (Get-Command tailscale -ErrorAction SilentlyContinue) {
+            $tailscaleIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null
+          }
+          
+          $output = @"
+          ==============================================================
+                          XYDESK RDP READY
+          ==============================================================
+          
+            Username:  $env:DESKTOP_USER
+            Password:  $env:DESKTOP_PASSWORD
+            RDP Port:  $env:RDP_PORT
+            Lifetime:  $env:SESSION_HOURS hours
+          
+            Direct IP:  $ip
+          ==============================================================
+          "@
+          
+          $output | Out-File -FilePath "$env:GITHUB_STEP_SUMMARY" -Encoding utf8
+          Write-Host $output
+          
+          @{
+            username = $env:DESKTOP_USER
+            password = $env:DESKTOP_PASSWORD
+            port = $env:RDP_PORT
+            ip = $ip
+            tailscale_ip = $tailscaleIP
+            cloudflare_domain = $env:CLOUDFLARE_TUNNEL_ID
+          } | ConvertTo-Json | Out-File "C:\Users\Public\xydesk-credentials.json" -Encoding utf8
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $endTime = (Get-Date).AddHours([int]$env:SESSION_HOURS)
+          Write-Host "Session will end at: $endTime"
+          
+          while ((Get-Date) -lt $endTime) {
+            $remaining = $endTime - (Get-Date)
+            Write-Host "Time remaining: $($remaining.ToString('hh\:mm\:ss'))"
+            
+            try {
+              $ts = Get-Service TermService -ErrorAction Stop
+              if ($ts.Status -ne 'Running') { Start-Service TermService }
+            } catch {}
+            
+            Start-Sleep 300
+          }
+          
+          Write-Host "Session ending..."
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "C:\Users\Public\xydesk-credentials.json" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\AppData\Local\Google\Chrome\User Data\Default\History" -Force -ErrorAction SilentlyContinue
+          Write-Host "Cleanup done"

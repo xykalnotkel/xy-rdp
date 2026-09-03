@@ -1,0 +1,9 @@
+# Default owners untuk semua file
+* @your-username
+
+# Workflow files butuh review extra
+/.github/workflows/ @your-username
+
+# Dokumentasi bisa di-review sama kontributor
+/docs/ @your-username
+README.md @your-username

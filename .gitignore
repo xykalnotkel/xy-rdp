@@ -1,0 +1,46 @@
+# Secrets & credentials
+*.json
+!package.json
+!tsconfig.json
+!package-lock.json
+xydesk-credentials.json
+*.env
+.env
+secrets.txt
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Build artifacts
+node_modules/
+__pycache__/
+*.pyc
+*.class
+*.dll
+*.exe
+!installer.exe  # allow downloaded installers in scripts
+target/
+build/
+dist/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+.Trashes
+
+# Temp
+tmp/
+temp/
+*.tmp

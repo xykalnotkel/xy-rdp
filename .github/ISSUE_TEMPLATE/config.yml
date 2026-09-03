@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/your-username/xy-rdp/discussions
+    about: Tanya jawab umum dan diskusi fitur
+  - name: Documentation
+    url: https://github.com/your-username/xy-rdp/blob/main/README.md
+    about: Baca README dan docs/ untuk panduan lengkap
