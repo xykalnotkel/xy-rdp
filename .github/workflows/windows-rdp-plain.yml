@@ -76,38 +76,11 @@ jobs:
           Start-Sleep 5
           Write-Host "RDP on port $env:RDP_PORT"
 
-      - name: Setup Cloudflare Tunnel
-        if: env.CLOUDFLARE_TUNNEL_TOKEN != ''
+      - name: Setup Cloudflare Tunnel (DISABLED - use IP direct)
+        if: false
         shell: pwsh
-        continue-on-error: true
         run: |
-          $cfExe = "C:\tools\cloudflared.exe"
-          if (-not (Test-Path $cfExe)) {
-            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfExe
-          }
-          # Stop existing service if any
-          Stop-Service Cloudflared -Force -ErrorAction SilentlyContinue
-          Start-Sleep 2
-          sc.exe delete Cloudflared 2>$null | Out-Null
-          Start-Sleep 2
-          # Install service (capture all output, don't fail)
-          $installResult = & $cfExe service install $env:CLOUDFLARE_TUNNEL_TOKEN 2>&1
-          Write-Host "Install result: $installResult"
-          Start-Sleep 3
-          # Try to start the service
-          $startResult = sc.exe start Cloudflared 2>&1
-          Write-Host "Start result: $startResult"
-          Start-Sleep 5
-          # Verify
-          $svc = Get-Service Cloudflared -ErrorAction SilentlyContinue
-          if ($svc) {
-            Write-Host "Cloudflared service status: $($svc.Status)"
-            if ($svc.Status -ne 'Running') {
-              Start-Service Cloudflared -ErrorAction SilentlyContinue
-              Start-Sleep 3
-            }
-          }
-          Write-Host "Cloudflare Tunnel setup complete (service may be running)"
+          Write-Host "Cloudflare Tunnel disabled - RDP via direct IP only"
 
       - name: Get connection info
         shell: pwsh
