@@ -19,6 +19,11 @@ on:
         required: true
         default: '13389'
         type: string
+      tunnel_target:
+        description: 'Tunnel target (rdp.xyc.my.id atau "none" untuk direct IP)'
+        required: true
+        default: 'rdp.xyc.my.id'
+        type: string
 
 jobs:
   rdp:
@@ -32,6 +37,7 @@ jobs:
       DESKTOP_PASSWORD: ${{ github.event.inputs.password }}
       RDP_PORT: ${{ github.event.inputs.rdp_port }}
       SESSION_HOURS: ${{ github.event.inputs.duration }}
+      TUNNEL_TARGET: ${{ github.event.inputs.tunnel_target }}
       CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
       CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 
@@ -59,7 +65,7 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:DESKTOP_USER -ErrorAction SilentlyContinue
           Disable-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
-          Write-Host "User $env:DESKTOP_USER created with admin"
+          Write-Host "User $env:DESKTOP_USER created"
 
       - name: Configure RDP + Firewall
         shell: pwsh
@@ -76,25 +82,62 @@ jobs:
           Start-Sleep 5
           Write-Host "RDP on port $env:RDP_PORT"
 
-      - name: Setup Cloudflare Tunnel (DISABLED - use IP direct)
-        if: false
+      - name: Setup Cloudflare Tunnel (quick tunnel mode)
+        if: env.CLOUDFLARE_TUNNEL_TOKEN != '' && env.TUNNEL_TARGET != 'none'
         shell: pwsh
+        continue-on-error: true
         run: |
-          Write-Host "Cloudflare Tunnel disabled - RDP via direct IP only"
+          $cfExe = "C:\tools\cloudflared.exe"
+          if (-not (Test-Path $cfExe)) {
+            New-Item -ItemType Directory -Path "C:\tools" -Force | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfExe
+          }
+          # Stop existing
+          Stop-Service Cloudflared -Force -ErrorAction SilentlyContinue
+          sc.exe delete Cloudflared 2>$null | Out-Null
+          Start-Sleep 2
+          # Install as service
+          & $cfExe service install $env:CLOUDFLARE_TUNNEL_TOKEN 2>$null
+          Start-Sleep 3
+          sc.exe start Cloudflared 2>$null
+          Start-Sleep 8
+          $svc = Get-Service Cloudflared -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -eq 'Running') {
+            Write-Host "Cloudflare Tunnel running (service mode)"
+          } else {
+            Write-Host "WARNING: Service mode failed, but RDP still active on port $env:RDP_PORT"
+          }
 
       - name: Get connection info
         shell: pwsh
         run: |
           $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Select-Object -First 1).IPAddress
+          $tunnelStatus = "disabled"
+          $svc = Get-Service Cloudflared -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -eq 'Running') { $tunnelStatus = "active" }
+          
           $summary = @"
           ==============================================
-            XYDESK RDP READY (Plain)
+            XYDESK RDP READY
           ==============================================
             User:     $env:DESKTOP_USER
             Pass:     $env:DESKTOP_PASSWORD
             Port:     $env:RDP_PORT
             Lifetime: $env:SESSION_HOURS hours
-            IP:       $ip
+            Cloudflare: $tunnelStatus
+          ==============================================
+            DIRECT IP (GHA internal, ga accessible):
+              $ip
+          ==============================================
+            TO CONNECT:
+            1. Install 'cloudflared' di device kamu
+               https://github.com/cloudflare/cloudflared/releases
+            2. Run:
+               cloudflared access rdp --hostname $env:TUNNEL_TARGET --url localhost:$env:RDP_PORT
+            3. Buka Microsoft Remote Desktop
+               -> localhost:$env:RDP_PORT
+               -> user: $env:DESKTOP_USER
+               -> pass: $env:DESKTOP_PASSWORD
           ==============================================
           "@
           $summary | Out-File -FilePath "$env:GITHUB_STEP_SUMMARY" -Encoding utf8
